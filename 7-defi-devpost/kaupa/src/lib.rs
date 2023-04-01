@@ -137,10 +137,11 @@
 //! chooses flash loans as a way of generating steady revenue through
 //! Kaupa: take a look at `test_goldland_scenario` and its
 //! documentation in the `tests` directory. Towards the end of that
-//! function there is a comprehensive example of building a
-//! transaction manifest that takes out a flash loan, uses it to
-//! generate revenue, asserts that it was able to get the profit it
-//! expected from it, and of course pays back the loan.
+//! function (near the text "flash loan marker") there is a
+//! comprehensive example of building a transaction manifest that
+//! takes out a flash loan, uses it to generate revenue, asserts that
+//! it was able to get the profit it expected from it, and of course
+//! pays back the loan.
 //!
 //! # Fees
 //!
@@ -276,13 +277,28 @@
 //!
 //! Run the test suite with `scrypto test` on the command line.
 //!
-//! ## Disabled Tests
+//! ## The Goldland Scenario Test
 //!
-//! Two of the tests are currently disabled by use of the ignore
-//! directive. Both are flash loan tests, one is disabled because
-//! flash loans don't seem to work correctly in the current Scrypto
-//! version and the other because it has a very long run time (and
-//! also again because flash loans).
+//! The `test_goldland_scenario` test has a long run time and
+//! therefore has been set to ignore so that usually it doesn't get
+//! run. Comment out the `#[ignore]` line just above it to enable
+//! it. It tests two things: high traffic (this is what takes so much
+//! time: a ton of transactions getting run) and also a useful
+//! application of flash loans (Bob takes out a flash loan, uses it to
+//! generate profit for himself, then pays back the loan).
+//!
+//! Note that an instructive part of the goldland test code is where
+//! it builds a full transaction manifest that takes out a flash loan,
+//! uses it to generate profit, ensures that the expected profit
+//! actually materialized, then pays back the flash loan. To see it
+//! search for the string "flash loan marker" in `test/lib.rs` which I
+//! put just in front of that code to make it easier to find.
+//!
+//! Part of the goldland test runs some sweep calls that should be
+//! heavy enough to exceed the unit cost limit in the system. The
+//! limit gets overridden in the test so that it can run, and so this
+//! can be a useful test to run when working on code optimizations in
+//! the future.
 //!
 //! ## Test Framework
 //!
@@ -378,6 +394,7 @@
 //! [collect_funds]: crate::kaupa::Kaupa::collect_funds
 
 use scrypto::prelude::*;
+use radix_engine_common::ManifestSbor;
 
 /// This alias is just to make the code slightly more
 /// self-documenting.
@@ -391,7 +408,7 @@ pub type Uuid = u128;
 /// defined in the struct. It is therefore imperative here that the
 /// `price_per` field is defined before the `uuid` field because that
 /// gives it sort order precedence.
-#[derive(ScryptoCategorize, ScryptoEncode, ScryptoDecode, LegacyDescribe, PartialEq, Eq, PartialOrd, Ord)]
+#[derive(ScryptoSbor, PartialEq, Eq, PartialOrd, Ord)]
 struct PriceAndUuid {
     price_per: Decimal,
     uuid: Uuid,
@@ -400,7 +417,7 @@ struct PriceAndUuid {
 /// This describes a flash loan debt owed to one of our proposals. It
 /// is used as non-fungible data on the transient NFT that forces the
 /// borrower to repay the debt.
-#[derive(NonFungibleData)]
+#[derive(ScryptoSbor, NonFungibleData)]
 struct FlashLoanDebt {
     pub proposal_uuid: Uuid,
     pub fungibles_owed: HashMap<ResourceAddress, Decimal>,
@@ -412,7 +429,7 @@ struct FlashLoanDebt {
 /// payment for some trade. Its purpose is to enable us to specify
 /// *either* "n amount of fungibles" *or* "these here non-fungibles"
 /// depending on which type of resource it is paired with.
-#[derive(ScryptoCategorize, ScryptoEncode, ScryptoDecode, LegacyDescribe, Clone, PartialEq, Eq, Debug)]
+#[derive(ScryptoSbor, ManifestSbor, Clone, PartialEq, Eq, Debug)]
 pub enum AskingType {
     /// Asks for this exact amount of a fungible token.
     Fungible(Decimal),
@@ -428,7 +445,7 @@ pub enum AskingType {
 }
 
 /// Enumerates the types of trade proposal that we support.
-#[derive(ScryptoCategorize, ScryptoEncode, ScryptoDecode, LegacyDescribe, Clone, PartialEq, Eq, Debug)]
+#[derive(ScryptoSbor, ManifestSbor, Clone, PartialEq, Eq, Debug)]
 pub enum ProposalType {
     /// Offer to sell a bag of tokens in exchange for another bag of
     /// tokens
@@ -440,7 +457,7 @@ pub enum ProposalType {
 
 /// This is the bread and butter of the Kaupa component: the
 /// specification of a trade proposal.
-#[derive(ScryptoCategorize, ScryptoEncode, ScryptoDecode, LegacyDescribe)]
+#[derive(ScryptoSbor)]
 struct TradeProposal {
     /// We automatically assign a random uuid to new proposals, and
     /// this is used to refer back to them later.
@@ -474,7 +491,7 @@ struct TradeProposal {
 /// This is the main fee structure that defines the fee levels of each
 /// individual Kaupa instance.
 // Public so we can use it from the test suite
-#[derive(ScryptoCategorize, ScryptoEncode, ScryptoDecode, LegacyDescribe, Clone, PartialEq, Eq, Debug)]
+#[derive(ScryptoSbor, ManifestSbor, Clone, PartialEq, Eq, Debug)]
 pub struct Fees {
     /// This is charged once for every maker interaction.
     pub per_tx_maker_fixed_fee: Option<HashMap<ResourceAddress, AskingType>>,
@@ -633,7 +650,7 @@ mod kaupa {
                     .mint_initial_supply(1);
 
                 flash_loan_resource =
-                    Some(ResourceBuilder::new_uuid_non_fungible()
+                    Some(ResourceBuilder::new_uuid_non_fungible::<FlashLoanDebt>()
                          .metadata(
                              "name",
                              "Transient tokens for Kaupa flash loans",
@@ -642,17 +659,6 @@ mod kaupa {
                                    AccessRule::DenyAll)
                          .burnable(rule!(require(flash_loan_badge_bucket.resource_address())),
                                    AccessRule::DenyAll)
-
-                         // NOTE: If you comment out the following
-                         // line the flash loan tests will be able to
-                         // run successfully. Be warned though that
-                         // when you do that, repayment of the flash
-                         // loan is not enforced by the ledger and so
-                         // this cannot be used for actual business.
-                         //
-                         // See the test `test_flash_loans` for a note
-                         // on the state of transient tokens and flash
-                         // loans atm.
                          .restrict_deposit(AccessRule::DenyAll, AccessRule::DenyAll)
                          .create_with_no_initial_supply());
                 flash_loan_badge = Some(Vault::with_bucket(flash_loan_badge_bucket));

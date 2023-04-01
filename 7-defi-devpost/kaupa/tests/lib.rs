@@ -1,4 +1,3 @@
-use radix_engine_interface::model::FromPublicKey;
 use scrypto::prelude::*;
 use scrypto_unit::*;
 use transaction::builder::ManifestBuilder;
@@ -6,13 +5,14 @@ use kaupa::AskingType as AskingType;
 use kaupa::ProposalType as ProposalType;
 use kaupa::Fees as Fees;
 use radix_engine::transaction::TransactionReceipt;
-use transaction::model::BasicInstruction;
+use radix_engine_common::ManifestSbor;
+use transaction::model::Instruction;
 use kaupa::Uuid as Uuid;
 
 
 /// Empty data structure for our non-fungibles. None of our tests care
 /// what is in the data (nor does the Kaupa component).
-#[derive(NonFungibleData)]
+#[derive(ScryptoSbor, ManifestSbor, NonFungibleData)]
 struct NFData {
 }
 
@@ -40,18 +40,24 @@ fn create_nft_resource(test_runner: &mut TestRunner,
                        owner_account: &ComponentAddress,
                        base: u64,
                        amount: u64) -> ResourceAddress {
-    // Create the side1 NFT resource
+
+    let mut access_rules = BTreeMap::new();
+    access_rules.insert(
+        ResourceMethodAuthKey::Mint,
+        (rule!(allow_all), rule!(deny_all)));
+    // We're just faking the simplest None we can get away with here
+    // (because faking it with the usual None::<String> doesn't work
+    // in this case)
+    let empty_supply: Option<Vec<(NonFungibleLocalId, NFData)>> = None;
     let manifest = ManifestBuilder::new()
-        .create_non_fungible_resource_with_owner(
+        .create_non_fungible_resource(
             NonFungibleIdType::Integer,
             BTreeMap::new(),
-            owner_nfgid.clone(),
-            Some((1..amount+1).map(
-                |n| (NonFungibleLocalId::Integer((base+n).into()), NFData{}))
-                 .collect::<HashMap<NonFungibleLocalId, NFData>>()))
+            access_rules,
+            empty_supply)
         .call_method(*owner_account,
                      "deposit_batch",
-                     args!(ManifestExpression::EntireWorktop))
+                     manifest_args!(ManifestExpression::EntireWorktop))
         .build();
     let receipt = test_runner.execute_manifest_ignoring_fee(
         manifest,
@@ -61,10 +67,36 @@ fn create_nft_resource(test_runner: &mut TestRunner,
     receipt.expect_commit_success();
     let resaddr =
         receipt
-        .expect_commit()
-        .entity_changes
-        .new_resource_addresses[0];
+        .expect_commit(true)
+        .new_resource_addresses()[0];
 
+    let mut minted = 0;
+
+    // We mint in batches because there is a max-substates-write limit
+    // that we might hit otherwise when making lots of NFTs.
+    while minted < amount {
+        let mut to_mint = amount - minted;
+        if to_mint > 1000 { to_mint = 1000; }
+
+        let manifest = ManifestBuilder::new()
+            .mint_non_fungible(
+                resaddr,
+                (minted..minted+to_mint).map(
+                    |n| (NonFungibleLocalId::Integer((base+n).into()), NFData{}))
+                    .collect::<HashMap<NonFungibleLocalId, NFData>>())
+            .call_method(*owner_account,
+                         "deposit_batch",
+                         manifest_args!(ManifestExpression::EntireWorktop))
+            .build();
+        let receipt = test_runner.execute_manifest_ignoring_fee(
+            manifest,
+            vec![owner_nfgid.clone()],
+        );
+
+        receipt.expect_commit_success();
+        minted += to_mint;
+    }
+    
     assert_eq!(&Decimal::from(amount),
                test_runner.get_component_resources(*owner_account).get(&resaddr).unwrap(),
                "NFT balance should start as expected");
@@ -83,13 +115,13 @@ fn give_tokens(test_runner: &mut TestRunner,
                amount: u64) {
    // Create the side1 NFT resource
     let manifest = ManifestBuilder::new()
-        .withdraw_from_account_by_amount(
+        .withdraw_from_account(
             *giver_account,
-            amount.into(),
-            *gift_token)
+            *gift_token,
+            amount.into())
         .call_method(*recip_account,
                      "deposit_batch",
-                     args!(ManifestExpression::EntireWorktop))
+                     manifest_args!(ManifestExpression::EntireWorktop))
         .build();
     let receipt = test_runner.execute_manifest_ignoring_fee(
         manifest,
@@ -110,7 +142,7 @@ fn component_has_nflids(test_runner: &mut TestRunner,
                         nf_resource: ResourceAddress,
                         nflids: Vec<u64>) -> bool {
     let vaults = test_runner.get_component_vaults(component, nf_resource);
-    let vault_nflids = test_runner.inspect_nft_vault(vaults[0]).unwrap();
+    let vault_nflids = test_runner.inspect_non_fungible_vault(vaults[0]).unwrap();
     return nflids.into_iter().all(
         |nflid| vault_nflids.contains(&NonFungibleLocalId::Integer(nflid.into())));
 }
@@ -122,7 +154,7 @@ fn filter_by_owned_nflids(test_runner: &mut TestRunner,
                           nf_resource: ResourceAddress,
                           nflids: Vec<u64>) -> Vec<u64>{
     let vaults = test_runner.get_component_vaults(component, nf_resource);
-    let vault_nflids = test_runner.inspect_nft_vault(vaults[0]).unwrap();
+    let vault_nflids = test_runner.inspect_non_fungible_vault(vaults[0]).unwrap();
     let mut retval: Vec<u64> = Vec::new();
     for nflid_int in nflids {
         let nflid = NonFungibleLocalId::Integer(nflid_int.into());
@@ -137,7 +169,7 @@ fn _print_nflids_owned(test_runner: &mut TestRunner,
                       component: ComponentAddress,
                       nf_resource: ResourceAddress) {
     let vaults = test_runner.get_component_vaults(component, nf_resource);
-    let vault_nflids = test_runner.inspect_nft_vault(vaults[0]).unwrap();
+    let vault_nflids = test_runner.inspect_non_fungible_vault(vaults[0]).unwrap();
     println!("{:?}", vault_nflids);
 }
 
@@ -158,8 +190,8 @@ fn make_trading_pair_proposal_f2f(
 {
     let manifest = ManifestBuilder::new()
         .create_proof_from_account(*account, *owning_nft_resaddr)
-        .withdraw_from_account_by_amount(*account, offer_amount, offer_resaddr)
-        .withdraw_from_account_by_amount(*account, fee_amount, fee_resaddr)
+        .withdraw_from_account(*account, offer_resaddr, offer_amount)
+        .withdraw_from_account(*account, fee_resaddr, fee_amount)
         .create_proof_from_auth_zone_by_ids(
             &BTreeSet::from([owning_nft_lid.into()]),
             *owning_nft_resaddr,
@@ -174,7 +206,7 @@ fn make_trading_pair_proposal_f2f(
                             |builder, fee_bucket_id| {
                                 builder.call_method(
                                     *kaupa, "make_proposal",
-                                    args!(proof_id,
+                                    manifest_args!(proof_id,
                                           None::<NonFungibleGlobalId>,
                                           ProposalType::Barter,
                                           Vec::<ManifestBucket>::from([paying_bucket_id]),
@@ -190,7 +222,7 @@ fn make_trading_pair_proposal_f2f(
             })
         .call_method(*account,
                      "deposit_batch",
-                     args!(ManifestExpression::EntireWorktop))
+                     manifest_args!(ManifestExpression::EntireWorktop))
         .build();
     let receipt = test_runner.execute_manifest_ignoring_fee(
         manifest,
@@ -225,12 +257,13 @@ fn make_trading_pair_proposal_nf2nf(
     };
     let manifest = ManifestBuilder::new()
         .create_proof_from_account(*account, *owning_nft_resaddr)
-        .withdraw_from_account_by_amount(*account, fee1_amount.into(), fee1_resaddr)
-        .withdraw_from_account_by_amount(*account, fee2_amount.into(), fee2_resaddr)
-        .withdraw_from_account_by_ids(*account,
-                                      &offer_nflids.into_iter().map(
-                                          |nflid| NonFungibleLocalId::Integer(nflid.into())).collect(),
-                                      offer_resaddr)
+        .withdraw_from_account(*account, fee1_resaddr, fee1_amount.into())
+        .withdraw_from_account(*account, fee2_resaddr, fee2_amount.into())
+        .withdraw_non_fungibles_from_account(
+            *account,
+            offer_resaddr,
+            &offer_nflids.into_iter().map(
+                |nflid| NonFungibleLocalId::Integer(nflid.into())).collect())
         .create_proof_from_auth_zone_by_ids(
             &BTreeSet::from([owning_nft_lid.into()]),
             *owning_nft_resaddr,
@@ -246,7 +279,7 @@ fn make_trading_pair_proposal_nf2nf(
                                     |builder, fee2_bucket_id| {
                                         builder.call_method(
                                             *kaupa, "make_proposal",
-                                            args!(proof_id,
+                                            manifest_args!(proof_id,
                                                   None::<NonFungibleGlobalId>,
                                                   ProposalType::Barter,
                                                   Vec::<ManifestBucket>::from([offer_bucket_id]),
@@ -297,12 +330,13 @@ fn make_trading_pair_proposal_nf2f(
 {
     let manifest = ManifestBuilder::new()
         .create_proof_from_account(*account, *owning_nft_resaddr)
-        .withdraw_from_account_by_amount(*account, fee1_amount.into(), fee1_resaddr)
-        .withdraw_from_account_by_amount(*account, fee2_amount.into(), fee2_resaddr)
-        .withdraw_from_account_by_ids(*account,
-                                      &offer_nflids.into_iter().map(
-                                          |nflid| NonFungibleLocalId::Integer(nflid.into())).collect(),
-                                      offer_resaddr)
+        .withdraw_from_account(*account, fee1_resaddr, fee1_amount.into())
+        .withdraw_from_account(*account, fee2_resaddr, fee2_amount.into())
+        .withdraw_non_fungibles_from_account(
+            *account,
+            offer_resaddr,
+            &offer_nflids.into_iter().map(
+                |nflid| NonFungibleLocalId::Integer(nflid.into())).collect())
         .create_proof_from_auth_zone_by_ids(
             &BTreeSet::from([owning_nft_lid.into()]),
             *owning_nft_resaddr,
@@ -318,7 +352,7 @@ fn make_trading_pair_proposal_nf2f(
                                     |builder, fee2_bucket_id| {
                                         builder.call_method(
                                             *kaupa, "make_proposal",
-                                            args!(proof_id,
+                                            manifest_args!(proof_id,
                                                   None::<NonFungibleGlobalId>,
                                                   ProposalType::Barter,
                                                   Vec::<ManifestBucket>::from([offer_bucket_id]),
@@ -379,9 +413,9 @@ fn make_trading_pair_proposal_f2nf(
     
     let manifest = ManifestBuilder::new()
         .create_proof_from_account(*account, *owning_nft_resaddr)
-        .withdraw_from_account_by_amount(*account, fee1_amount.into(), fee1_resaddr)
-        .withdraw_from_account_by_amount(*account, fee2_amount.into(), fee2_resaddr)
-        .withdraw_from_account_by_amount(*account, offer_amount, offer_resaddr)
+        .withdraw_from_account(*account, fee1_resaddr, fee1_amount.into())
+        .withdraw_from_account(*account, fee2_resaddr, fee2_amount.into())
+        .withdraw_from_account(*account, offer_resaddr, offer_amount)
         .create_proof_from_auth_zone_by_ids(
             &BTreeSet::from([owning_nft_lid.into()]),
             *owning_nft_resaddr,
@@ -397,7 +431,7 @@ fn make_trading_pair_proposal_f2nf(
                                     |builder, fee2_bucket_id| {
                                         builder.call_method(
                                             *kaupa, "make_proposal",
-                                            args!(proof_id,
+                                            manifest_args!(proof_id,
                                                   None::<NonFungibleGlobalId>,
                                                   ProposalType::Barter,
                                                   Vec::<ManifestBucket>::from([offer_bucket_id]),
@@ -468,11 +502,11 @@ fn currency_vec_to_manifest_grab<'a>(mut manifest: &'a mut ManifestBuilder,
         if is_at_fung(&currency.1) {
             // Fungible resource
             manifest = manifest
-                .withdraw_from_account_by_amount(*account, at_to_fung(&currency.1), currency.0);
+                .withdraw_from_account(*account, currency.0, at_to_fung(&currency.1));
 
             let bucket_id;
             (manifest, bucket_id, _) =
-                manifest.add_instruction(BasicInstruction::TakeFromWorktopByAmount{
+                manifest.add_instruction(Instruction::TakeFromWorktopByAmount{
                     amount: at_to_fung(&currency.1),
                     resource_address: currency.0.clone()
                 });
@@ -480,11 +514,11 @@ fn currency_vec_to_manifest_grab<'a>(mut manifest: &'a mut ManifestBuilder,
         } else {
             // Non-fungible resource
             manifest = manifest
-                .withdraw_from_account_by_ids(*account, &at_to_nonfung(&currency.1), currency.0);
+                .withdraw_non_fungibles_from_account(*account, currency.0, &at_to_nonfung(&currency.1));
 
             let bucket_id;
             (manifest, bucket_id, _) =
-                manifest.add_instruction(BasicInstruction::TakeFromWorktopByIds{
+                manifest.add_instruction(Instruction::TakeFromWorktopByIds{
                     ids: at_to_nonfung(&currency.1),
                     resource_address: currency.0.clone()
                 });
@@ -508,7 +542,7 @@ fn currency_vec_to_manifest_grab_fm_worktop<'a>(mut manifest: &'a mut ManifestBu
             // Fungible resource
             let bucket_id;
             (manifest, bucket_id, _) =
-                manifest.add_instruction(BasicInstruction::TakeFromWorktopByAmount{
+                manifest.add_instruction(Instruction::TakeFromWorktopByAmount{
                     amount: at_to_fung(&currency.1),
                     resource_address: currency.0.clone()
                 });
@@ -517,7 +551,7 @@ fn currency_vec_to_manifest_grab_fm_worktop<'a>(mut manifest: &'a mut ManifestBu
             // Non-fungible resource
             let bucket_id;
             (manifest, bucket_id, _) =
-                manifest.add_instruction(BasicInstruction::TakeFromWorktopByIds{
+                manifest.add_instruction(Instruction::TakeFromWorktopByIds{
                     ids: at_to_nonfung(&currency.1),
                     resource_address: currency.0.clone()
                 });
@@ -562,8 +596,8 @@ fn make_generic_proposal(
     instruction_counter += 1;
     let mut manifest = builder
         .create_proof_from_account_by_ids(*account,
-                                          &BTreeSet::from([owning_nft_lid.into()]),
-                                          *owning_nft_resaddr);
+                                          *owning_nft_resaddr,
+                                          &BTreeSet::from([owning_nft_lid.into()]));
     instruction_counter += 1;
 
     let offering_bucket_ids;
@@ -583,7 +617,7 @@ fn make_generic_proposal(
             |builder, proof_id| {
                 builder.call_method(
                     *kaupa, "make_proposal",
-                    args!(proof_id,
+                    manifest_args!(proof_id,
                           counterparty,
                           ptype,
                           Vec::<ManifestBucket>::from(offering_bucket_ids),
@@ -594,7 +628,7 @@ fn make_generic_proposal(
             })
         .call_method(*account,
                      "deposit_batch",
-                     args!(ManifestExpression::EntireWorktop))
+                     manifest_args!(ManifestExpression::EntireWorktop))
         .build();
     instruction_counter += 1;
 
@@ -603,7 +637,7 @@ fn make_generic_proposal(
         vec![user_nfgid.clone()],
     );
 
-    let uuid = receipt.output::<(u128, Vec<Bucket>)>(instruction_counter).0;
+    let uuid = receipt.expect_commit(true).output::<(u128, Vec<Bucket>)>(instruction_counter).0;
     ( receipt,  uuid )
 }
 
@@ -624,12 +658,12 @@ fn accept_proposal_f(
     other_fee_amount: Decimal) -> TransactionReceipt
 {
     let manifest = ManifestBuilder::new()
-        .withdraw_from_account_by_amount(*account,
-                                         other_fee_amount,
-                                         other_fee_resaddr)
-        .withdraw_from_account_by_amount(*account,
-                                         payment_amount + fee_amount,
-                                         payment_resaddr)
+        .withdraw_from_account(*account,
+                               other_fee_resaddr,
+                               other_fee_amount)
+        .withdraw_from_account(*account,
+                               payment_resaddr,
+                               payment_amount + fee_amount)
         .take_from_worktop_by_amount(
             payment_amount,
             payment_resaddr,
@@ -644,7 +678,7 @@ fn accept_proposal_f(
                             |builder, other_fee_bucket_id| {
                                 builder.call_method(
                                     *kaupa, "accept_proposal",
-                                    args!(None::<NonFungibleGlobalId>,
+                                    manifest_args!(None::<NonFungibleGlobalId>,
                                           proposal_uuid,
                                           allow_partial,
                                           Vec::<ManifestBucket>::from([payment_bucket_id]),
@@ -655,7 +689,7 @@ fn accept_proposal_f(
             })
         .call_method(*account,
                      "deposit_batch",
-                     args!(ManifestExpression::EntireWorktop))
+                     manifest_args!(ManifestExpression::EntireWorktop))
         .build();
     let receipt = test_runner.execute_manifest_ignoring_fee(
         manifest,
@@ -682,15 +716,15 @@ fn accept_proposal_nf2f(
     fee2_amount: Decimal) -> TransactionReceipt
 {
     let manifest = ManifestBuilder::new()
-        .withdraw_from_account_by_amount(*account,
-                                         fee1_amount,
-                                         fee1_resaddr)
-        .withdraw_from_account_by_amount(*account,
-                                         fee2_amount,
-                                         fee2_resaddr)
-        .withdraw_from_account_by_amount(*account,
-                                         payment_amount + payment_fee,
-                                         payment_resaddr)
+        .withdraw_from_account(*account,
+                               fee1_resaddr,
+                               fee1_amount)
+        .withdraw_from_account(*account,
+                               fee2_resaddr,
+                               fee2_amount)
+        .withdraw_from_account(*account,
+                               payment_resaddr,
+                               payment_amount + payment_fee)
         .take_from_worktop_by_amount(
             payment_amount,
             payment_resaddr,
@@ -709,7 +743,7 @@ fn accept_proposal_nf2f(
                                     |builder, fee2_bucket_id| {
                                         builder.call_method(
                                             *kaupa, "accept_proposal",
-                                            args!(None::<NonFungibleGlobalId>,
+                                            manifest_args!(None::<NonFungibleGlobalId>,
                                                   proposal_uuid,
                                                   allow_partial,
                                                   Vec::<ManifestBucket>::from([payment_bucket_id]),
@@ -722,7 +756,7 @@ fn accept_proposal_nf2f(
             })
         .call_method(*account,
                      "deposit_batch",
-                     args!(ManifestExpression::EntireWorktop))
+                     manifest_args!(ManifestExpression::EntireWorktop))
         .build();
     let receipt = test_runner.execute_manifest_ignoring_fee(
         manifest,
@@ -750,15 +784,15 @@ fn accept_proposal_f2nf(
     let payment_nflids = payment_nflids.into_iter().map(
         |nflid| NonFungibleLocalId::Integer(nflid.into())).collect();
     let manifest = ManifestBuilder::new()
-        .withdraw_from_account_by_amount(*account,
-                                         fee1_amount,
-                                         fee1_resaddr)
-        .withdraw_from_account_by_amount(*account,
-                                         fee2_amount,
-                                         fee2_resaddr)
-        .withdraw_from_account_by_ids(*account,
-                                         &payment_nflids,
-                                         payment_resaddr)
+        .withdraw_from_account(*account,
+                               fee1_resaddr,
+                               fee1_amount)
+        .withdraw_from_account(*account,
+                               fee2_resaddr,
+                               fee2_amount)
+        .withdraw_non_fungibles_from_account(*account,
+                                             payment_resaddr,
+                                             &payment_nflids)
                 .take_from_worktop_by_ids(
                     &payment_nflids,
                     payment_resaddr,
@@ -773,7 +807,7 @@ fn accept_proposal_f2nf(
                                     |builder, fee2_bucket_id| {
                                         builder.call_method(
                                             *kaupa, "accept_proposal",
-                                            args!(None::<NonFungibleGlobalId>,
+                                            manifest_args!(None::<NonFungibleGlobalId>,
                                                   proposal_uuid,
                                                   allow_partial,
                                                   Vec::<ManifestBucket>::from([payment_bucket_id]),
@@ -784,7 +818,7 @@ fn accept_proposal_f2nf(
                     })
         .call_method(*account,
                      "deposit_batch",
-                     args!(ManifestExpression::EntireWorktop))
+                     manifest_args!(ManifestExpression::EntireWorktop))
         .build();
     let receipt = test_runner.execute_manifest_ignoring_fee(
         manifest,
@@ -814,19 +848,20 @@ fn accept_proposal_nf(
     fee3_amount: Decimal) -> TransactionReceipt
 {
     let manifest = ManifestBuilder::new()
-        .withdraw_from_account_by_amount(*account,
-                                         fee1_amount,
-                                         fee1_resaddr)
-        .withdraw_from_account_by_amount(*account,
-                                         fee2_amount,
-                                         fee2_resaddr)
-        .withdraw_from_account_by_amount(*account,
-                                         fee3_amount,
-                                         fee3_resaddr)
-        .withdraw_from_account_by_ids(*account,
-                                      &payment_nflids.into_iter().map(
-                                          |nflid| NonFungibleLocalId::Integer(nflid.into())).collect(),
-                                      payment_resaddr)
+        .withdraw_from_account(*account,
+                               fee1_resaddr,
+                               fee1_amount)
+        .withdraw_from_account(*account,
+                               fee2_resaddr,
+                               fee2_amount)
+        .withdraw_from_account(*account,
+                               fee3_resaddr,
+                               fee3_amount)
+        .withdraw_non_fungibles_from_account(
+            *account,
+            payment_resaddr,
+            &payment_nflids.into_iter().map(
+                |nflid| NonFungibleLocalId::Integer(nflid.into())).collect())
         .take_from_worktop(
             payment_resaddr,
             |builder, payment_bucket_id| {
@@ -844,7 +879,7 @@ fn accept_proposal_nf(
                                     |builder, fee3_bucket_id| {
                                         builder.call_method(
                                             *kaupa, "accept_proposal",
-                                            args!(None::<NonFungibleGlobalId>,
+                                            manifest_args!(None::<NonFungibleGlobalId>,
                                                   proposal_uuid,
                                                   allow_partial,
                                                   Vec::<ManifestBucket>::from([payment_bucket_id]),
@@ -858,7 +893,7 @@ fn accept_proposal_nf(
             })
         .call_method(*account,
                      "deposit_batch",
-                     args!(ManifestExpression::EntireWorktop))
+                     manifest_args!(ManifestExpression::EntireWorktop))
         .build();
     let receipt = test_runner.execute_manifest_ignoring_fee(
         manifest,
@@ -896,11 +931,11 @@ fn accept_otc_proposal(
             manifest = 
                 manifest.create_proof_from_account_by_ids(
                     *account,
-                    &BTreeSet::from([nflid.into()]),
-                    resaddr);
+                    resaddr,
+                    &BTreeSet::from([nflid.into()]));
             let proof;
             (manifest, _, proof) =
-                manifest.add_instruction(BasicInstruction::CreateProofFromAuthZoneByIds{
+                manifest.add_instruction(Instruction::CreateProofFromAuthZoneByIds{
                     ids: BTreeSet::from([nflid.into()]),
                     resource_address: resaddr
                 });
@@ -911,14 +946,14 @@ fn accept_otc_proposal(
     let manifest = manifest
         .call_method(
             *kaupa, "accept_proposal",
-            args!(trader_proof,
+            manifest_args!(trader_proof,
                   proposal_uuid,
                   allow_partial,
                   Vec::<ManifestBucket>::from(paying_bucket_ids),
                   Vec::<ManifestBucket>::from(fee_bucket_ids)))
         .call_method(*account,
                      "deposit_batch",
-                     args!(ManifestExpression::EntireWorktop))
+                     manifest_args!(ManifestExpression::EntireWorktop))
         .build();
     let receipt = test_runner.execute_manifest_ignoring_fee(
         manifest,
@@ -958,11 +993,11 @@ fn accept_flash_loan(
             manifest = 
                 manifest.create_proof_from_account_by_ids(
                     *account,
-                    &BTreeSet::from([nflid.into()]),
-                    resaddr);
+                    resaddr,
+                    &BTreeSet::from([nflid.into()]));
             let proof;
             (manifest, _, proof) =
-                manifest.add_instruction(BasicInstruction::CreateProofFromAuthZoneByIds{
+                manifest.add_instruction(Instruction::CreateProofFromAuthZoneByIds{
                     ids: BTreeSet::from([nflid.into()]),
                     resource_address: resaddr
                 });
@@ -973,7 +1008,7 @@ fn accept_flash_loan(
     let mut manifest = manifest
         .call_method(
             *kaupa, "accept_proposal",
-            args!(trader_proof,
+            manifest_args!(trader_proof,
                   proposal_uuid,
                   false,
                   Vec::<ManifestBucket>::from(paying_bucket_ids),
@@ -1003,7 +1038,7 @@ fn accept_flash_loan(
         // The following line is for debugging the transient_resource
         // problem farther down.
         .assert_worktop_contains_by_amount(1.into(), transient_resource)
-        .add_instruction(BasicInstruction::TakeFromWorktop{
+        .add_instruction(Instruction::TakeFromWorktop{
             resource_address: transient_resource
         });
     
@@ -1013,7 +1048,7 @@ fn accept_flash_loan(
     let mut manifest = manifest
         .call_method(
             *kaupa, "repay_flash_loan",
-            args!(
+            manifest_args!(
                 transient_bucket_id.unwrap(),
                 Vec::<ManifestBucket>::from(repay_bucket_ids))
         )
@@ -1040,7 +1075,7 @@ fn accept_flash_loan(
         // transient_resource is burnt.
         .call_method(*account,
                      "deposit_batch",
-                     args!(ManifestExpression::EntireWorktop))
+                     manifest_args!(ManifestExpression::EntireWorktop))
         .build();
     let receipt = test_runner.execute_manifest_ignoring_fee(
         manifest,
@@ -1054,6 +1089,7 @@ fn accept_flash_loan(
 /// Sweeps zero or one or more proposals
 fn sweep_proposals(
     test_runner: &mut TestRunner,
+    override_uc_limit: bool, // override unit cost limit or not
     user_nfgid: &NonFungibleGlobalId,
     kaupa: &ComponentAddress,
     account: &ComponentAddress,
@@ -1076,33 +1112,52 @@ fn sweep_proposals(
             manifest = 
                 manifest.create_proof_from_account_by_ids(
                     *account,
-                    &BTreeSet::from([nflid.into()]),
-                    resaddr);
+                    resaddr,
+                    &BTreeSet::from([nflid.into()]));
             let proof;
             (manifest, _, proof) =
-                manifest.add_instruction(BasicInstruction::CreateProofFromAuthZoneByIds{
+                manifest.add_instruction(Instruction::CreateProofFromAuthZoneByIds{
                     ids: BTreeSet::from([nflid.into()]),
                     resource_address: resaddr
                 });
             proof
         }
     };
-    
+
+    if override_uc_limit {
+        manifest = manifest
+            .call_method(
+                *account,
+                "lock_fee",
+                manifest_args!(dec!("100")))
+    }
     let manifest = manifest
         .call_method(
             *kaupa, "sweep_proposals",
-            args!(trader_proof,
+            manifest_args!(trader_proof,
                   max_price,
                   &paying_bucket_ids[0],
                   Vec::<ManifestBucket>::from(fee_bucket_ids)))
         .call_method(*account,
                      "deposit_batch",
-                     args!(ManifestExpression::EntireWorktop))
+                     manifest_args!(ManifestExpression::EntireWorktop))
         .build();
-    let receipt = test_runner.execute_manifest_ignoring_fee(
-        manifest,
-        vec![user_nfgid.clone()],
-    );
+
+    let receipt = if override_uc_limit {
+        // We may exceed the regular cost unit limit here which
+        // creates an interesting case for future optimization to deal
+        // with.
+        test_runner.execute_manifest_with_cost_unit_limit(
+            manifest,
+            vec![user_nfgid.clone()],
+            200000000
+        )
+    } else {
+        test_runner.execute_manifest_ignoring_fee(
+            manifest,
+            vec![user_nfgid.clone()],
+        )
+    };
 
     receipt
 }
@@ -1126,14 +1181,14 @@ fn collect_funds(
             *owning_nft_resaddr,
             |builder, proof_id| {
                 builder.call_method(*kaupa, "collect_funds",
-                                    args!(proof_id,
+                                    manifest_args!(proof_id,
                                           true,
                                           collect_fees,
                                           collect_token))
             })
         .call_method(*account,
                      "deposit_batch",
-                     args!(ManifestExpression::EntireWorktop))
+                     manifest_args!(ManifestExpression::EntireWorktop))
         .build();
     let receipt = test_runner.execute_manifest_ignoring_fee(
         manifest,
@@ -1146,7 +1201,6 @@ fn collect_funds(
 /// Sets up a fungible/fungible trading pair and runs it through its
 /// paces.
 #[test]
-//#[ignore]
 fn test_f2f_trading_pair() {
     // Setup the environment
     let mut test_runner = TestRunner::builder().build();
@@ -1167,14 +1221,12 @@ fn test_f2f_trading_pair() {
     let package_address = test_runner.compile_and_publish(this_package!());
 
     let manifest = ManifestBuilder::new()
-        .create_fungible_resource_with_owner(
-            18,
+        .new_token_fixed(
             BTreeMap::new(),
-            user2_nfgid.clone(),
-            Some(dec!("100000")))
+            dec!("100000"))
         .call_method(user2_account,
                      "deposit_batch",
-                     args!(ManifestExpression::EntireWorktop))
+                     manifest_args!(ManifestExpression::EntireWorktop))
         .build();
     let receipt = test_runner.execute_manifest_ignoring_fee(
         manifest,
@@ -1183,9 +1235,8 @@ fn test_f2f_trading_pair() {
 
     receipt.expect_commit_success();
     let side1_resaddr = receipt
-        .expect_commit()
-        .entity_changes
-        .new_resource_addresses[0];
+        .expect_commit(true)
+        .new_resource_addresses()[0];
     assert_eq!(&dec!("100000"),
                test_runner.get_component_resources(user2_account).get(&side1_resaddr).unwrap(),
                "TOK balance should start as expected");
@@ -1201,19 +1252,19 @@ fn test_f2f_trading_pair() {
     // Call the `instantiate_kaupa` function with a fungible trading pair
     let manifest = ManifestBuilder::new()
         .call_function(package_address, "Kaupa", "instantiate_kaupa",
-                       args!(&kaupa_admin_badge,
+                       manifest_args!(&kaupa_admin_badge,
                              None::<String>,
                              None::<String>,
                              None::<String>,
                              Some(Fees{
                                  per_tx_maker_fixed_fee: Some(
                                      HashMap::<ResourceAddress, AskingType>::from([(
-                                     RADIX_TOKEN, AskingType::Fungible("0.5".into()))])),
+                                     RADIX_TOKEN, AskingType::Fungible(dec!("0.5")))])),
                                  per_tx_taker_fixed_fee: Some(
                                      HashMap::<ResourceAddress, AskingType>::from([(
-                                     RADIX_TOKEN, AskingType::Fungible("0.75".into()))])),
+                                     RADIX_TOKEN, AskingType::Fungible(dec!("0.75")))])),
                                  per_nft_flat_fee: None,
-                                 per_payment_bps_fee: Some("10".into()),
+                                 per_payment_bps_fee: Some(dec!("10")),
                              }),
                              Some(HashSet::from([side1_resaddr])),
                              Some(HashSet::from([RADIX_TOKEN])),
@@ -1228,9 +1279,8 @@ fn test_f2f_trading_pair() {
 
     receipt.expect_commit_success();
     let component = receipt
-        .expect_commit()
-        .entity_changes
-        .new_component_addresses[0];
+        .expect_commit(true)
+        .new_component_addresses()[0];
 
 
     let mut sum_of_all_fees = HashMap::from([(RADIX_TOKEN, Decimal::ZERO),
@@ -1249,15 +1299,15 @@ fn test_f2f_trading_pair() {
                                              &nft_resaddr,
                                              1,
                                              RADIX_TOKEN,
-                                             "10".into(),
+                                             dec!("10"),
                                              side1_resaddr,
-                                             "1".into(),
+                                             dec!("1"),
                                              RADIX_TOKEN,
-                                             "0.5".into());
-    receipt.expect_commit_success();
+                                             dec!("0.5"));
+    let result = receipt.expect_commit_success();
     *sum_of_all_fees.get_mut(&RADIX_TOKEN).unwrap() += dec!("0.5");
 
-    let uuid1 = receipt.output::<(u128, Vec<Bucket>)>(7).0;
+    let uuid1 = result.output::<(u128, Vec<Bucket>)>(7).0;
 
     assert_eq!(pre_xrd_balance - dec!("10.5"),
                *test_runner.get_component_resources(user1_account).get(&RADIX_TOKEN).unwrap(),
@@ -1272,13 +1322,13 @@ fn test_f2f_trading_pair() {
             nft_resaddr,
             |builder, proof_id| {
                 builder.call_method(component, "rescind_proposal",
-                                    args!(proof_id,
+                                    manifest_args!(proof_id,
                                           uuid1
                                     ))
             })
         .call_method(user1_account,
                      "deposit_batch",
-                     args!(ManifestExpression::EntireWorktop))
+                     manifest_args!(ManifestExpression::EntireWorktop))
         .build();
     let receipt = test_runner.execute_manifest_ignoring_fee(
         manifest,
@@ -1298,13 +1348,13 @@ fn test_f2f_trading_pair() {
             nft_resaddr,
             |builder, proof_id| {
                 builder.call_method(component, "rescind_proposal",
-                                    args!(proof_id,
+                                    manifest_args!(proof_id,
                                           uuid1
                                     ))
             })
         .call_method(user1_account,
                      "deposit_batch",
-                     args!(ManifestExpression::EntireWorktop))
+                     manifest_args!(ManifestExpression::EntireWorktop))
         .build();
     let receipt = test_runner.execute_manifest_ignoring_fee(
         manifest,
@@ -1327,11 +1377,11 @@ fn test_f2f_trading_pair() {
                                              &nft_resaddr,
                                              1,
                                              RADIX_TOKEN,
-                                             "5".into(),
+                                             dec!("5"),
                                              side1_resaddr,
-                                             "25".into(),
+                                             dec!("25"),
                                              RADIX_TOKEN,
-                                             "0.1".into()); // fee is 0.5
+                                             dec!("0.1")); // fee is 0.5
     receipt.expect_commit_failure();
 
 
@@ -1348,15 +1398,15 @@ fn test_f2f_trading_pair() {
                                              &nft_resaddr,
                                              1,
                                              RADIX_TOKEN,
-                                             "5".into(),
+                                             dec!("5"),
                                              side1_resaddr,
-                                             "25".into(),
+                                             dec!("25"),
                                              RADIX_TOKEN,
-                                             "0.5".into());
-    receipt.expect_commit_success();
+                                             dec!("0.5"));
+    let result = receipt.expect_commit_success();
     *sum_of_all_fees.get_mut(&RADIX_TOKEN).unwrap() += dec!("0.5");
 
-    let uuid = receipt.output::<(u128, Vec<Bucket>)>(7).0;
+    let uuid = result.output::<(u128, Vec<Bucket>)>(7).0;
 
     assert_eq!(pre_xrd_balance - dec!("5.5"),
                *test_runner.get_component_resources(user1_account).get(&RADIX_TOKEN).unwrap(),
@@ -1371,10 +1421,10 @@ fn test_f2f_trading_pair() {
                                   uuid,
                                   false,
                                   side1_resaddr,
-                                  "25".into(),
-                                  "0.025".into(),
+                                  dec!("25"),
+                                  dec!("0.025"),
                                   RADIX_TOKEN,
-                                  "0.2".into()); // fee is 0.75
+                                  dec!("0.2")); // fee is 0.75
     receipt.expect_commit_failure();
 
 
@@ -1387,10 +1437,10 @@ fn test_f2f_trading_pair() {
                                   uuid,
                                   false,
                                   side1_resaddr,
-                                  "25".into(),
-                                  "0.025".into(),
+                                  dec!("25"),
+                                  dec!("0.025"),
                                   side1_resaddr,
-                                  "1".into()); // fee is 0.75 XRD
+                                  dec!("1")); // fee is 0.75 XRD
     receipt.expect_commit_failure();
 
     
@@ -1407,10 +1457,10 @@ fn test_f2f_trading_pair() {
                                   uuid,
                                   false,
                                   side1_resaddr,
-                                  "25".into(),
-                                  "0.025".into(),
+                                  dec!("25"),
+                                  dec!("0.025"),
                                   RADIX_TOKEN,
-                                  "0.75".into());
+                                  dec!("0.75"));
     receipt.expect_commit_success();
     
     assert_eq!(pre_tok_balance - 25 - dec!("0.025"),
@@ -1448,11 +1498,11 @@ fn test_f2f_trading_pair() {
                                              &nft_resaddr,
                                              1,
                                              side1_resaddr,
-                                             "10".into(),
+                                             dec!("10"),
                                              RADIX_TOKEN,
-                                             "3".into(),
+                                             dec!("3"),
                                              side1_resaddr,
-                                             "1".into()); // fee is 0.5 XRD
+                                             dec!("1")); // fee is 0.5 XRD
     receipt.expect_commit_failure();
 
     
@@ -1473,16 +1523,16 @@ fn test_f2f_trading_pair() {
                                              &nft_resaddr,
                                              1,
                                              side1_resaddr,
-                                             "10".into(),
+                                             dec!("10"),
                                              RADIX_TOKEN,
-                                             "3".into(),
+                                             dec!("3"),
                                              RADIX_TOKEN,
-                                             "5.5".into()); // only 0.5 actually needed
-    receipt.expect_commit_success();
+                                             dec!("5.5")); // only 0.5 actually needed
+    let result = receipt.expect_commit_success();
     *sum_of_all_fees.get_mut(&RADIX_TOKEN).unwrap() += dec!("0.5");
 
     // The generated UUID for our trade proposal
-    let uuid = receipt.output::<(u128, Vec<Bucket>)>(7).0;
+    let uuid = result.output::<(u128, Vec<Bucket>)>(7).0;
 
     assert_eq!(pre_tok_balance - 10,
                *test_runner.get_component_resources(user1_account).get(&side1_resaddr).unwrap(),
@@ -1506,10 +1556,10 @@ fn test_f2f_trading_pair() {
                                   uuid,
                                   false,
                                   RADIX_TOKEN,
-                                  "3".into(),
-                                  "0.003".into(),
+                                  dec!("3"),
+                                  dec!("0.003"),
                                   RADIX_TOKEN,
-                                  "0.75".into());
+                                  dec!("0.75"));
     receipt.expect_commit_success();
     
     assert_eq!(pre_tok_balance + 10,
@@ -1552,16 +1602,16 @@ fn test_f2f_trading_pair() {
                                              &nft_resaddr,
                                              1,
                                              side1_resaddr,
-                                             "10".into(),
+                                             dec!("10"),
                                              RADIX_TOKEN,
-                                             "3".into(),
+                                             dec!("3"),
                                              RADIX_TOKEN,
-                                             "0.5".into());
-    receipt.expect_commit_success();
+                                             dec!("0.5"));
+    let result = receipt.expect_commit_success();
     *sum_of_all_fees.get_mut(&RADIX_TOKEN).unwrap() += dec!("0.5");
 
     // The generated UUID for our trade proposal
-    let uuid = receipt.output::<(u128, Vec<Bucket>)>(7).0;
+    let uuid = result.output::<(u128, Vec<Bucket>)>(7).0;
 
     assert_eq!(&dec!(5),
                test_runner.get_component_resources(user1_account).get(&side1_resaddr).unwrap(),
@@ -1585,10 +1635,10 @@ fn test_f2f_trading_pair() {
                                   uuid,
                                   false,
                                   RADIX_TOKEN,
-                                  "3".into(),
-                                  "1".into(), // only 0.003 actually needed
+                                  dec!("3"),
+                                  dec!("1"), // only 0.003 actually needed
                                   RADIX_TOKEN,
-                                  "0.75".into()); 
+                                  dec!("0.75")); 
     receipt.expect_commit_success();
     
     assert_eq!(pre_tok_balance + 10,
@@ -1663,16 +1713,16 @@ fn test_f2f_trading_pair() {
                                              &nft_resaddr,
                                              1,
                                              RADIX_TOKEN,
-                                             "10".into(),
+                                             dec!("10"),
                                              side1_resaddr,
-                                             "3".into(),
+                                             dec!("3"),
                                              RADIX_TOKEN,
-                                             "0.5".into()); // only 0.5 actually needed
-    receipt.expect_commit_success();
+                                             dec!("0.5")); // only 0.5 actually needed
+    let result = receipt.expect_commit_success();
     *sum_of_all_fees.get_mut(&RADIX_TOKEN).unwrap() += dec!("0.5");
 
     // The generated UUID for our trade proposal
-    let uuid = receipt.output::<(u128, Vec<Bucket>)>(7).0;
+    let uuid = result.output::<(u128, Vec<Bucket>)>(7).0;
 
     assert_eq!(pre_xrd_balance - dec!("10") - dec!("0.5"),
                *test_runner.get_component_resources(user1_account).get(&RADIX_TOKEN).unwrap(),
@@ -1696,10 +1746,10 @@ fn test_f2f_trading_pair() {
                                   uuid,
                                   true,
                                   side1_resaddr,
-                                  "1".into(),
-                                  "0.001".into(),
+                                  dec!("1"),
+                                  dec!("0.001"),
                                   RADIX_TOKEN,
-                                  "0.75".into());
+                                  dec!("0.75"));
     receipt.expect_commit_success();
 
     assert_dec_approx(pre_xrd_balance + dec!("10") / 3
@@ -1743,10 +1793,10 @@ fn test_f2f_trading_pair() {
                                   uuid,
                                   false,
                                   side1_resaddr,
-                                  "2.1".into(),
-                                  "0.0021".into(),
+                                  dec!("2.1"),
+                                  dec!("0.0021"),
                                   RADIX_TOKEN,
-                                  "0.75".into());
+                                  dec!("0.75"));
     receipt.expect_commit_success();
 
     assert_dec_approx(pre_xrd_balance + dec!("10") * 2 / 3
@@ -1814,7 +1864,6 @@ fn test_f2f_trading_pair() {
 /// Sets up a non-fungible/non-fungible trading pair and puts it
 /// through its paces.
 #[test]
-//#[ignore]
 fn test_nf2nf_trading_pair() {
     // Setup the environment
     let mut test_runner = TestRunner::builder().build();
@@ -1897,20 +1946,20 @@ fn test_nf2nf_trading_pair() {
     // Call the `instantiate_kaupa` function with a non-fungible trading pair
     let manifest = ManifestBuilder::new()
         .call_function(package_address, "Kaupa", "instantiate_kaupa",
-                       args!(&kaupa_admin_badge,
+                       manifest_args!(&kaupa_admin_badge,
                              None::<String>,
                              None::<String>,
                              None::<String>,
                              Some(Fees{
                                  per_tx_maker_fixed_fee: Some(
                                      HashMap::<ResourceAddress, AskingType>::from([
-                                         (RADIX_TOKEN, AskingType::Fungible("7".into())),
+                                         (RADIX_TOKEN, AskingType::Fungible(dec!("7"))),
                                          (feenft_resaddr,
                                           AskingType::NonFungible(None, Some(1))),
                                      ])),
                                  per_tx_taker_fixed_fee: Some(
                                      HashMap::<ResourceAddress, AskingType>::from([
-                                         (RADIX_TOKEN, AskingType::Fungible("19".into())),
+                                         (RADIX_TOKEN, AskingType::Fungible(dec!("19"))),
                                          (feenft_resaddr,
                                           AskingType::NonFungible(None, Some(2))),
                                      ])),
@@ -1936,9 +1985,8 @@ fn test_nf2nf_trading_pair() {
 
     receipt.expect_commit_success();
     let component = receipt
-        .expect_commit()
-        .entity_changes
-        .new_component_addresses[0];
+        .expect_commit(true)
+        .new_component_addresses()[0];
 
 
     let mut sum_of_all_fees = HashMap::<ResourceAddress, Decimal>::from([
@@ -1970,12 +2018,12 @@ fn test_nf2nf_trading_pair() {
                                                 7,
                                                 feenft_resaddr,
                                                 1);
-    receipt.expect_commit_success();
+    let result = receipt.expect_commit_success();
     *sum_of_all_fees.get_mut(&RADIX_TOKEN).unwrap() += dec!(7);
     *sum_of_all_fees.get_mut(&feenft_resaddr).unwrap() += dec!(1);
 
     // The generated UUID for our trade proposal
-    let uuid = receipt.output::<(u128, Vec<Bucket>)>(9).0;
+    let uuid = result.output::<(u128, Vec<Bucket>)>(9).0;
 
     assert_eq!(pre_xrd_balance - dec!("7"),
                *test_runner.get_component_resources(user1_account).get(&RADIX_TOKEN).unwrap(),
@@ -2007,7 +2055,7 @@ fn test_nf2nf_trading_pair() {
                                      side2_resaddr,
                                      [101].into(),
                                      RADIX_TOKEN,
-                                     "24".into(),
+                                     dec!("24"),
                                      RADIX_TOKEN,
                                      19.into(),
                                      feenft_resaddr,
@@ -2104,12 +2152,12 @@ fn test_nf2nf_trading_pair() {
                                                 7,
                                                 feenft_resaddr,
                                                 1);
-    receipt.expect_commit_success();
+    let result = receipt.expect_commit_success();
     *sum_of_all_fees.get_mut(&RADIX_TOKEN).unwrap() += dec!(7);
     *sum_of_all_fees.get_mut(&feenft_resaddr).unwrap() += dec!(1);
 
     // The generated UUID for our trade proposal
-    let uuid1 = receipt.output::<(u128, Vec<Bucket>)>(9).0;
+    let uuid1 = result.output::<(u128, Vec<Bucket>)>(9).0;
 
     assert_eq!(pre_side1_balance - dec!("4"),
                *test_runner.get_component_resources(user1_account).get(&side1_resaddr).unwrap(),
@@ -2137,12 +2185,12 @@ fn test_nf2nf_trading_pair() {
                                                 7,
                                                 feenft_resaddr,
                                                 1);
-    receipt.expect_commit_success();
+    let result = receipt.expect_commit_success();
     *sum_of_all_fees.get_mut(&RADIX_TOKEN).unwrap() += dec!(7);
     *sum_of_all_fees.get_mut(&feenft_resaddr).unwrap() += dec!(1);
 
     // The generated UUID for our trade proposal
-    let uuid2 = receipt.output::<(u128, Vec<Bucket>)>(9).0;
+    let uuid2 = result.output::<(u128, Vec<Bucket>)>(9).0;
 
     assert_eq!(pre_side1_balance - dec!("3"),
                *test_runner.get_component_resources(user1_account).get(&side1_resaddr).unwrap(),
@@ -2169,12 +2217,12 @@ fn test_nf2nf_trading_pair() {
                                                 7,
                                                 feenft_resaddr,
                                                 1);
-    receipt.expect_commit_success();
+    let result = receipt.expect_commit_success();
     *sum_of_all_fees.get_mut(&RADIX_TOKEN).unwrap() += dec!(7);
     *sum_of_all_fees.get_mut(&feenft_resaddr).unwrap() += dec!(1);
 
     // The generated UUID for our trade proposal
-    let uuid3 = receipt.output::<(u128, Vec<Bucket>)>(9).0;
+    let uuid3 = result.output::<(u128, Vec<Bucket>)>(9).0;
 
     assert_eq!(pre_side1_balance - dec!("1"),
                *test_runner.get_component_resources(user1_account).get(&side1_resaddr).unwrap(),
@@ -2202,12 +2250,12 @@ fn test_nf2nf_trading_pair() {
                                                 7,
                                                 feenft_resaddr,
                                                 1);
-    receipt.expect_commit_success();
+    let result = receipt.expect_commit_success();
     *sum_of_all_fees.get_mut(&RADIX_TOKEN).unwrap() += dec!(7);
     *sum_of_all_fees.get_mut(&feenft_resaddr).unwrap() += dec!(1);
 
     // The generated UUID for our trade proposal
-    let uuid4 = receipt.output::<(u128, Vec<Bucket>)>(9).0;
+    let uuid4 = result.output::<(u128, Vec<Bucket>)>(9).0;
 
     assert_eq!(pre_side2_balance - dec!("3"),
                *test_runner.get_component_resources(user2_account).get(&side2_resaddr).unwrap(),
@@ -2237,12 +2285,12 @@ fn test_nf2nf_trading_pair() {
                                                 7,
                                                 feenft_resaddr,
                                                 1);
-    receipt.expect_commit_success();
+    let result = receipt.expect_commit_success();
     *sum_of_all_fees.get_mut(&RADIX_TOKEN).unwrap() += dec!(7);
     *sum_of_all_fees.get_mut(&feenft_resaddr).unwrap() += dec!(1);
 
     // The generated UUID for our trade proposal
-    let uuid5 = receipt.output::<(u128, Vec<Bucket>)>(9).0;
+    let uuid5 = result.output::<(u128, Vec<Bucket>)>(9).0;
 
     assert_eq!(pre_side2_balance - dec!("3"),
                *test_runner.get_component_resources(user2_account).get(&side2_resaddr).unwrap(),
@@ -2259,7 +2307,7 @@ fn test_nf2nf_trading_pair() {
                                      side2_resaddr,
                                      [113].into(),
                                      RADIX_TOKEN,
-                                     "200".into(),
+                                     dec!("200"),
                                      RADIX_TOKEN,
                                      19.into(),
                                      feenft_resaddr,
@@ -2288,7 +2336,7 @@ fn test_nf2nf_trading_pair() {
                                      side2_resaddr,
                                      [115, 114].into(),
                                      RADIX_TOKEN,
-                                     "38".into(),
+                                     dec!("38"),
                                      RADIX_TOKEN,
                                      19.into(),
                                      feenft_resaddr,
@@ -2323,7 +2371,7 @@ fn test_nf2nf_trading_pair() {
                                      side2_resaddr,
                                      [113, 112].into(),
                                      RADIX_TOKEN,
-                                     "38".into(),
+                                     dec!("38"),
                                      RADIX_TOKEN,
                                      19.into(),
                                      feenft_resaddr,
@@ -2351,7 +2399,7 @@ fn test_nf2nf_trading_pair() {
                                      side2_resaddr,
                                      [112, 111, 113].into(),
                                      RADIX_TOKEN,
-                                     "52".into(),
+                                     dec!("52"),
                                      RADIX_TOKEN,
                                      19.into(),
                                      feenft_resaddr,
@@ -2393,7 +2441,7 @@ fn test_nf2nf_trading_pair() {
                                      side1_resaddr,
                                      [12].into(),
                                      RADIX_TOKEN,
-                                     "22".into(),
+                                     dec!("22"),
                                      RADIX_TOKEN,
                                      19.into(),
                                      feenft_resaddr,
@@ -2427,7 +2475,7 @@ fn test_nf2nf_trading_pair() {
                                      side1_resaddr,
                                      [10, 13, 14].into(),
                                      RADIX_TOKEN,
-                                     "42".into(),
+                                     dec!("42"),
                                      RADIX_TOKEN,
                                      19.into(),
                                      feenft_resaddr,
@@ -2455,7 +2503,7 @@ fn test_nf2nf_trading_pair() {
                                      side1_resaddr,
                                      [11, 13, 14].into(),
                                      RADIX_TOKEN,
-                                     "42".into(),
+                                     dec!("42"),
                                      RADIX_TOKEN,
                                      19.into(),
                                      feenft_resaddr,
@@ -2595,12 +2643,12 @@ fn test_nf2nf_trading_pair() {
                                                 7,
                                                 feenft_resaddr,
                                                 1);
-    receipt.expect_commit_success();
+    let result = receipt.expect_commit_success();
     *sum_of_all_fees.get_mut(&RADIX_TOKEN).unwrap() += dec!(7);
     *sum_of_all_fees.get_mut(&feenft_resaddr).unwrap() += dec!(1);
 
     // The generated UUID for our trade proposal
-    let uuid1 = receipt.output::<(u128, Vec<Bucket>)>(9).0;
+    let uuid1 = result.output::<(u128, Vec<Bucket>)>(9).0;
 
     assert_eq!(pre_side2_balance - dec!("5"),
                *test_runner.get_component_resources(user2_account).get(&side2_resaddr).unwrap(),
@@ -2618,7 +2666,7 @@ fn test_nf2nf_trading_pair() {
                                      side1_resaddr,
                                      [11, 13].into(),
                                      RADIX_TOKEN,
-                                     "50".into(),
+                                     dec!("50"),
                                      RADIX_TOKEN,
                                      19.into(),
                                      feenft_resaddr,
@@ -2651,12 +2699,12 @@ fn test_nf2nf_trading_pair() {
                                                 7,
                                                 feenft_resaddr,
                                                 1);
-    receipt.expect_commit_success();
+    let result = receipt.expect_commit_success();
     *sum_of_all_fees.get_mut(&RADIX_TOKEN).unwrap() += dec!(7);
     *sum_of_all_fees.get_mut(&feenft_resaddr).unwrap() += dec!(1);
 
     // The generated UUID for our trade proposal
-    let uuid2 = receipt.output::<(u128, Vec<Bucket>)>(9).0;
+    let uuid2 = result.output::<(u128, Vec<Bucket>)>(9).0;
 
     assert_eq!(pre_side2_balance - dec!("10"),
                *test_runner.get_component_resources(user2_account).get(&side2_resaddr).unwrap(),
@@ -2685,7 +2733,7 @@ fn test_nf2nf_trading_pair() {
                                      side1_resaddr,
                                      [20, 21, 22].into(),
                                      RADIX_TOKEN,
-                                     "40".into(),
+                                     dec!("40"),
                                      RADIX_TOKEN,
                                      19.into(),
                                      feenft_resaddr,
@@ -2730,7 +2778,7 @@ fn test_nf2nf_trading_pair() {
                                      side1_resaddr,
                                      [23, 24].into(),
                                      RADIX_TOKEN,
-                                     "40".into(),
+                                     dec!("40"),
                                      RADIX_TOKEN,
                                      19.into(),
                                      feenft_resaddr,
@@ -2780,12 +2828,12 @@ fn test_nf2nf_trading_pair() {
                                                 7,
                                                 feenft_resaddr,
                                                 1);
-    receipt.expect_commit_success();
+    let result = receipt.expect_commit_success();
     *sum_of_all_fees.get_mut(&RADIX_TOKEN).unwrap() += dec!(7);
     *sum_of_all_fees.get_mut(&feenft_resaddr).unwrap() += dec!(1);
 
     // The generated UUID for our trade proposal
-    let uuid1 = receipt.output::<(u128, Vec<Bucket>)>(9).0;
+    let uuid1 = result.output::<(u128, Vec<Bucket>)>(9).0;
 
     assert_eq!(pre_side2_balance - dec!("5"),
                *test_runner.get_component_resources(user2_account).get(&side2_resaddr).unwrap(),
@@ -2803,7 +2851,7 @@ fn test_nf2nf_trading_pair() {
                                      side1_resaddr,
                                      [31, 32].into(),
                                      RADIX_TOKEN,
-                                     "50".into(),
+                                     dec!("50"),
                                      RADIX_TOKEN,
                                      19.into(),
                                      feenft_resaddr,
@@ -2830,7 +2878,7 @@ fn test_nf2nf_trading_pair() {
                                      side1_resaddr,
                                      [ 30, 31, 32 ].into(),
                                      RADIX_TOKEN,
-                                     "50".into(),
+                                     dec!("50"),
                                      RADIX_TOKEN,
                                      19.into(),
                                      feenft_resaddr,
@@ -2877,12 +2925,12 @@ fn test_nf2nf_trading_pair() {
                                                 7,
                                                 feenft_resaddr,
                                                 1);
-    receipt.expect_commit_success();
+    let result = receipt.expect_commit_success();
     *sum_of_all_fees.get_mut(&RADIX_TOKEN).unwrap() += dec!(7);
     *sum_of_all_fees.get_mut(&feenft_resaddr).unwrap() += dec!(1);
 
     // The generated UUID for our trade proposal
-    let uuid2 = receipt.output::<(u128, Vec<Bucket>)>(9).0;
+    let uuid2 = result.output::<(u128, Vec<Bucket>)>(9).0;
 
     assert_eq!(pre_side2_balance - dec!("10"),
                *test_runner.get_component_resources(user2_account).get(&side2_resaddr).unwrap(),
@@ -2911,7 +2959,7 @@ fn test_nf2nf_trading_pair() {
                                      side1_resaddr,
                                      [33, 34, 35].into(),
                                      RADIX_TOKEN,
-                                     "40".into(),
+                                     dec!("40"),
                                      RADIX_TOKEN,
                                      19.into(),
                                      feenft_resaddr,
@@ -2963,7 +3011,7 @@ fn test_nf2nf_trading_pair() {
                                      side1_resaddr,
                                      payment,
                                      RADIX_TOKEN,
-                                     "40".into(),
+                                     dec!("40"),
                                      RADIX_TOKEN,
                                      19.into(),
                                      feenft_resaddr,
@@ -3014,12 +3062,12 @@ fn test_nf2nf_trading_pair() {
                                                 7,
                                                 feenft_resaddr,
                                                 1);
-    receipt.expect_commit_success();
+    let result = receipt.expect_commit_success();
     *sum_of_all_fees.get_mut(&RADIX_TOKEN).unwrap() += dec!(7);
     *sum_of_all_fees.get_mut(&feenft_resaddr).unwrap() += dec!(1);
 
     // The generated UUID for our trade proposal
-    let uuid1 = receipt.output::<(u128, Vec<Bucket>)>(9).0;
+    let uuid1 = result.output::<(u128, Vec<Bucket>)>(9).0;
 
     assert_eq!(pre_side2_balance - dec!("5"),
                *test_runner.get_component_resources(user2_account).get(&side2_resaddr).unwrap(),
@@ -3037,7 +3085,7 @@ fn test_nf2nf_trading_pair() {
                                      side1_resaddr,
                                      [40, 41].into(),
                                      RADIX_TOKEN,
-                                     "50".into(),
+                                     dec!("50"),
                                      RADIX_TOKEN,
                                      19.into(),
                                      feenft_resaddr,
@@ -3064,7 +3112,7 @@ fn test_nf2nf_trading_pair() {
                                      side1_resaddr,
                                      [ 40, 41, 42 ].into(),
                                      RADIX_TOKEN,
-                                     "50".into(),
+                                     dec!("50"),
                                      RADIX_TOKEN,
                                      19.into(),
                                      feenft_resaddr,
@@ -3112,12 +3160,12 @@ fn test_nf2nf_trading_pair() {
                                                 7,
                                                 feenft_resaddr,
                                                 1);
-    receipt.expect_commit_success();
+    let result = receipt.expect_commit_success();
     *sum_of_all_fees.get_mut(&RADIX_TOKEN).unwrap() += dec!(7);
     *sum_of_all_fees.get_mut(&feenft_resaddr).unwrap() += dec!(1);
 
     // The generated UUID for our trade proposal
-    let uuid2 = receipt.output::<(u128, Vec<Bucket>)>(9).0;
+    let uuid2 = result.output::<(u128, Vec<Bucket>)>(9).0;
 
     assert_eq!(pre_side2_balance - dec!("10"),
                *test_runner.get_component_resources(user2_account).get(&side2_resaddr).unwrap(),
@@ -3146,7 +3194,7 @@ fn test_nf2nf_trading_pair() {
                                      side1_resaddr,
                                      [47, 48, 49].into(),
                                      RADIX_TOKEN,
-                                     "40".into(),
+                                     dec!("40"),
                                      RADIX_TOKEN,
                                      19.into(),
                                      feenft_resaddr,
@@ -3191,7 +3239,7 @@ fn test_nf2nf_trading_pair() {
                                      side1_resaddr,
                                      [45, 46].into(),
                                      RADIX_TOKEN,
-                                     "40".into(),
+                                     dec!("40"),
                                      RADIX_TOKEN,
                                      19.into(),
                                      feenft_resaddr,
@@ -3242,12 +3290,12 @@ fn test_nf2nf_trading_pair() {
                                                 7,
                                                 feenft_resaddr,
                                                 1);
-    receipt.expect_commit_success();
+    let result = receipt.expect_commit_success();
     *sum_of_all_fees.get_mut(&RADIX_TOKEN).unwrap() += dec!(7);
     *sum_of_all_fees.get_mut(&feenft_resaddr).unwrap() += dec!(1);
 
     // The generated UUID for our trade proposal
-    let uuid3 = receipt.output::<(u128, Vec<Bucket>)>(9).0;
+    let uuid3 = result.output::<(u128, Vec<Bucket>)>(9).0;
 
     assert_eq!(pre_side2_balance - dec!("5"),
                *test_runner.get_component_resources(user2_account).get(&side2_resaddr).unwrap(),
@@ -3276,7 +3324,7 @@ fn test_nf2nf_trading_pair() {
                                      side1_resaddr,
                                      [71, 53, 54, 57, 61].into(),
                                      RADIX_TOKEN,
-                                     "44".into(),
+                                     dec!("44"),
                                      RADIX_TOKEN,
                                      19.into(),
                                      feenft_resaddr,
@@ -3326,7 +3374,7 @@ fn test_nf2nf_trading_pair() {
                                      side1_resaddr,
                                      [71, 72, 73, 74, 75, 76, 77, 51].into(),
                                      RADIX_TOKEN,
-                                     "88".into(),
+                                     dec!("88"),
                                      RADIX_TOKEN,
                                      19.into(),
                                      feenft_resaddr,
@@ -3452,7 +3500,7 @@ fn test_nf2f_trading_pair() {
     // non-fungible/fungible trading pair
     let manifest = ManifestBuilder::new()
         .call_function(package_address, "Kaupa", "instantiate_kaupa",
-                       args!(&kaupa_admin_badge,
+                       manifest_args!(&kaupa_admin_badge,
                              None::<String>,
                              None::<String>,
                              None::<String>,
@@ -3487,9 +3535,8 @@ fn test_nf2f_trading_pair() {
 
     receipt.expect_commit_success();
     let component = receipt
-        .expect_commit()
-        .entity_changes
-        .new_component_addresses[0];
+        .expect_commit(true)
+        .new_component_addresses()[0];
 
 
     let mut sum_of_all_fees = HashMap::<ResourceAddress, Decimal>::from([
@@ -3523,12 +3570,12 @@ fn test_nf2f_trading_pair() {
                                                    7,
                                                    fee_resaddr,
                                                    2);
-    receipt.expect_commit_success();
+    let result = receipt.expect_commit_success();
     *sum_of_all_fees.get_mut(&RADIX_TOKEN).unwrap() += dec!(7);
     *sum_of_all_fees.get_mut(&fee_resaddr).unwrap() += dec!(2);
 
     // The generated UUID for our trade proposal
-    let uuid1 = receipt.output::<(u128, Vec<Bucket>)>(9).0;
+    let uuid1 = result.output::<(u128, Vec<Bucket>)>(9).0;
 
     assert_eq!(pre_xrd_balance - 7,
                *test_runner.get_component_resources(user1_account).get(&RADIX_TOKEN).unwrap(),
@@ -3675,12 +3722,12 @@ fn test_nf2f_trading_pair() {
                                                    7,
                                                    fee_resaddr,
                                                    2);
-    receipt.expect_commit_success();
+    let result = receipt.expect_commit_success();
     *sum_of_all_fees.get_mut(&RADIX_TOKEN).unwrap() += dec!(7);
     *sum_of_all_fees.get_mut(&fee_resaddr).unwrap() += dec!(2);
 
     // The generated UUID for our trade proposal
-    let uuid2 = receipt.output::<(u128, Vec<Bucket>)>(9).0;
+    let uuid2 = result.output::<(u128, Vec<Bucket>)>(9).0;
 
     assert_eq!(pre_xrd_balance - 7,
                *test_runner.get_component_resources(user1_account).get(&RADIX_TOKEN).unwrap(),
@@ -3777,7 +3824,7 @@ fn test_nf2f_trading_pair() {
                                        25.into(), // only 20 gets taken
                                        dec!("0.0075"), // so only 0.006 is needed
                                        RADIX_TOKEN,
-                                       "46.5".into(),  // and only 41 is needed here
+                                       dec!("46.5"),  // and only 41 is needed here
                                        fee_resaddr,
                                        3.into());
     receipt.expect_commit_success();
@@ -3885,12 +3932,12 @@ fn test_nf2f_trading_pair() {
                                                   7,
                                                   fee_resaddr,
                                                   2);
-    receipt.expect_commit_success();
+    let result = receipt.expect_commit_success();
     *sum_of_all_fees.get_mut(&RADIX_TOKEN).unwrap() += dec!(7);
     *sum_of_all_fees.get_mut(&fee_resaddr).unwrap() += dec!(2);
 
     // The generated UUID for our trade proposal
-    let uuid2 = receipt.output::<(u128, Vec<Bucket>)>(9).0;
+    let uuid2 = result.output::<(u128, Vec<Bucket>)>(9).0;
 
     assert_eq!(pre_xrd_balance - 7,
                *test_runner.get_component_resources(user2_account).get(&RADIX_TOKEN).unwrap(),
@@ -4264,7 +4311,7 @@ fn test_otc_any2any() {
     // non-fungible/fungible trading pair
     let manifest = ManifestBuilder::new()
         .call_function(package_address, "Kaupa", "instantiate_kaupa",
-                       args!(&kaupa_admin_badge,
+                       manifest_args!(&kaupa_admin_badge,
                              None::<String>,
                              None::<String>,
                              None::<String>,
@@ -4295,9 +4342,8 @@ fn test_otc_any2any() {
 
     receipt.expect_commit_success();
     let component = receipt
-        .expect_commit()
-        .entity_changes
-        .new_component_addresses[0];
+        .expect_commit(true)
+        .new_component_addresses()[0];
 
 
     let mut sum_of_all_fees = HashMap::<ResourceAddress, Decimal>::from([
@@ -4933,7 +4979,7 @@ fn test_sweep_f2f() {
     // fungible/fungible trading pair
     let manifest = ManifestBuilder::new()
         .call_function(package_address, "Kaupa", "instantiate_kaupa",
-                       args!(&kaupa_admin_badge,
+                       manifest_args!(&kaupa_admin_badge,
                              None::<String>,
                              None::<String>,
                              None::<String>,
@@ -4956,9 +5002,8 @@ fn test_sweep_f2f() {
 
     receipt.expect_commit_success();
     let component = receipt
-        .expect_commit()
-        .entity_changes
-        .new_component_addresses[0];
+        .expect_commit(true)
+        .new_component_addresses()[0];
 
 
     // user2 adds a number of limit buy orders
@@ -5189,6 +5234,7 @@ fn test_sweep_f2f() {
     let receipt =
         sweep_proposals(
             &mut test_runner,
+            false,
             &user2_nfgid,
             &component,
             &user2_account,
@@ -5234,6 +5280,7 @@ fn test_sweep_f2f() {
     let receipt =
         sweep_proposals(
             &mut test_runner,
+            false,
             &user2_nfgid,
             &component,
             &user2_account,
@@ -5281,6 +5328,7 @@ fn test_sweep_f2f() {
     let receipt =
         sweep_proposals(
             &mut test_runner,
+            false,
             &user2_nfgid,
             &component,
             &user2_account,
@@ -5327,6 +5375,7 @@ fn test_sweep_f2f() {
     let receipt =
         sweep_proposals(
             &mut test_runner,
+            false,
             &user2_nfgid,
             &component,
             &user2_account,
@@ -5379,6 +5428,7 @@ fn test_sweep_f2f() {
     let receipt =
         sweep_proposals(
             &mut test_runner,
+            false,
             &user1_nfgid,
             &component,
             &user1_account,
@@ -5424,6 +5474,7 @@ fn test_sweep_f2f() {
     let receipt =
         sweep_proposals(
             &mut test_runner,
+            false,
             &user1_nfgid,
             &component,
             &user1_account,
@@ -5469,6 +5520,7 @@ fn test_sweep_f2f() {
     let receipt =
         sweep_proposals(
             &mut test_runner,
+            false,
             &user1_nfgid,
             &component,
             &user1_account,
@@ -5593,7 +5645,7 @@ fn test_sweep_nf2f() {
     // non-fungible/fungible trading pair
     let manifest = ManifestBuilder::new()
         .call_function(package_address, "Kaupa", "instantiate_kaupa",
-                       args!(&kaupa_admin_badge,
+                       manifest_args!(&kaupa_admin_badge,
                              None::<String>,
                              None::<String>,
                              None::<String>,
@@ -5620,9 +5672,8 @@ fn test_sweep_nf2f() {
 
     receipt.expect_commit_success();
     let component = receipt
-        .expect_commit()
-        .entity_changes
-        .new_component_addresses[0];
+        .expect_commit(true)
+        .new_component_addresses()[0];
 
 
     // Sell side order book:
@@ -5754,6 +5805,7 @@ fn test_sweep_nf2f() {
     let receipt =
         sweep_proposals(
             &mut test_runner,
+            false,
             &user2_nfgid,
             &component,
             &user2_account,
@@ -5800,6 +5852,7 @@ fn test_sweep_nf2f() {
     let receipt =
         sweep_proposals(
             &mut test_runner,
+            false,
             &user2_nfgid,
             &component,
             &user2_account,
@@ -5847,6 +5900,7 @@ fn test_sweep_nf2f() {
     let receipt =
         sweep_proposals(
             &mut test_runner,
+            false,
             &user2_nfgid,
             &component,
             &user2_account,
@@ -6001,6 +6055,7 @@ fn test_sweep_nf2f() {
     let receipt =
         sweep_proposals(
             &mut test_runner,
+            false,
             &user1_nfgid,
             &component,
             &user1_account,
@@ -6043,6 +6098,7 @@ fn test_sweep_nf2f() {
     let receipt =
         sweep_proposals(
             &mut test_runner,
+            false,
             &user1_nfgid,
             &component,
             &user1_account,
@@ -6100,6 +6156,7 @@ fn test_sweep_nf2f() {
     let receipt =
         sweep_proposals(
             &mut test_runner,
+            false,
             &user1_nfgid,
             &component,
             &user1_account,
@@ -6157,6 +6214,7 @@ fn test_sweep_nf2f() {
     let receipt =
         sweep_proposals(
             &mut test_runner,
+            false,
             &user1_nfgid,
             &component,
             &user1_account,
@@ -6279,7 +6337,7 @@ fn test_sweep_nf2nf() {
     // non-fungible/non-fungible trading pair
     let manifest = ManifestBuilder::new()
         .call_function(package_address, "Kaupa", "instantiate_kaupa",
-                       args!(&kaupa_admin_badge,
+                       manifest_args!(&kaupa_admin_badge,
                              None::<String>,
                              None::<String>,
                              None::<String>,
@@ -6308,9 +6366,8 @@ fn test_sweep_nf2nf() {
 
     receipt.expect_commit_success();
     let component = receipt
-        .expect_commit()
-        .entity_changes
-        .new_component_addresses[0];
+        .expect_commit(true)
+        .new_component_addresses()[0];
 
 
 
@@ -6491,6 +6548,7 @@ fn test_sweep_nf2nf() {
     let receipt =
         sweep_proposals(
             &mut test_runner,
+            false,
             &user2_nfgid,
             &component,
             &user2_account,
@@ -6551,6 +6609,7 @@ fn test_sweep_nf2nf() {
     let receipt =
         sweep_proposals(
             &mut test_runner,
+            false,
             &user2_nfgid,
             &component,
             &user2_account,
@@ -6610,6 +6669,7 @@ fn test_sweep_nf2nf() {
     let receipt =
         sweep_proposals(
             &mut test_runner,
+            false,
             &user2_nfgid,
             &component,
             &user2_account,
@@ -6652,22 +6712,7 @@ fn test_sweep_nf2nf() {
 
 
 /// This tests a basic flash loan.
-///
-/// I have disabled this test because there appears to be a bug in 0.8
-/// Scrypto where the transaction manifest sees there is a transient
-/// bucket with zero tokens in it and panics when it should just ignore
-/// that situation.
-///
-/// While this means that our flash loans cannot possibly work at this
-/// time I have still implemented them and their tests in the
-/// expectation that this will start working when the above problem
-/// gets fixed (for RCnet 1?)
-///
-/// Note, if you want to pretend that flash loans are currently
-/// working you can comment out a line in the `instantiate_kaupa`
-/// function as specified there and then run the flash loan tests.
 #[test]
-#[ignore]
 fn test_flash_loans() {
     // Setup the environment
     let mut test_runner = TestRunner::builder().build();
@@ -6763,7 +6808,7 @@ fn test_flash_loans() {
     // non-fungible/non-fungible trading pair
     let manifest = ManifestBuilder::new()
         .call_function(package_address, "Kaupa", "instantiate_kaupa",
-                       args!(&kaupa_admin_badge,
+                       manifest_args!(&kaupa_admin_badge,
                              None::<String>,
                              None::<String>,
                              None::<String>,
@@ -6791,12 +6836,11 @@ fn test_flash_loans() {
     );
 
     receipt.expect_commit_success();
-    let component = receipt
-        .expect_commit()
-        .entity_changes
-        .new_component_addresses[0];
+    let result = receipt
+        .expect_commit(true);
+    let component = result.new_component_addresses()[0];
 
-    let transient_resource = receipt.output::<(ComponentAddress, Option<ResourceAddress>)>(1)
+    let transient_resource = result.output::<(ComponentAddress, Option<ResourceAddress>)>(1)
         .1.unwrap();
 
     // user1 offers a flash loan
@@ -6973,9 +7017,6 @@ fn test_flash_loans() {
 /// on a trading pair, just to give the thing a good workout, before
 /// it gets to the flash loan part. Because of this it is usually set
 /// to ignore.
-///
-/// Also see the note about the flash loan bug in the comment to the
-/// the test_flash_loans function.
 #[test]
 #[ignore]
 fn test_goldland_scenario() {
@@ -7030,7 +7071,7 @@ fn test_goldland_scenario() {
         NonFungibleGlobalId::new(alice_nftres, 1.into());
     let manifest = ManifestBuilder::new()
         .call_function(package_address, "Kaupa", "instantiate_kaupa",
-                       args!(&kaupa1_admin_badge,
+                       manifest_args!(&kaupa1_admin_badge,
                              Some("Goldland marketplace"),
                              Some("Trade your land and gold here!"),
                              Some("https://___goldlandex___.com"),
@@ -7053,9 +7094,8 @@ fn test_goldland_scenario() {
 
     receipt.expect_commit_success();
     let kaupa1 = receipt
-        .expect_commit()
-        .entity_changes
-        .new_component_addresses[0];
+        .expect_commit(true)
+        .new_component_addresses()[0];
 
 
     
@@ -7064,7 +7104,7 @@ fn test_goldland_scenario() {
         NonFungibleGlobalId::new(victor_nftres, 1.into());
     let manifest = ManifestBuilder::new()
         .call_function(package_address, "Kaupa", "instantiate_kaupa",
-                       args!(&kaupa2_admin_badge,
+                       manifest_args!(&kaupa2_admin_badge,
                              Some("Barters R Us"),
                              Some("The premier marketplace for any bartering ever"),
                              Some("https://---barters-r-us---.com"),
@@ -7086,12 +7126,11 @@ fn test_goldland_scenario() {
     );
 
     receipt.expect_commit_success();
-    let kaupa2 = receipt
-        .expect_commit()
-        .entity_changes
-        .new_component_addresses[0];
+    let result = receipt
+        .expect_commit(true);
+    let kaupa2 = result.new_component_addresses()[0];
     
-    let transient_resource = receipt.output::<(ComponentAddress, Option<ResourceAddress>)>(1)
+    let transient_resource = result.output::<(ComponentAddress, Option<ResourceAddress>)>(1)
         .1.unwrap();
 
 
@@ -7138,6 +7177,7 @@ fn test_goldland_scenario() {
         let receipt =
             sweep_proposals(
                 &mut test_runner,
+                true,
                 &charlie_nfgid,
                 &kaupa1,
                 &charlie_account,
@@ -7171,6 +7211,7 @@ fn test_goldland_scenario() {
         let receipt =
             sweep_proposals(
                 &mut test_runner,
+                true,
                 &bob_nfgid,
                 &kaupa1,
                 &bob_account,
@@ -7227,9 +7268,11 @@ fn test_goldland_scenario() {
     // trading pair. We write this out in full here to give a clear
     // idea how a flash loan manifest can be built.
 
+    // (flash loan marker)
+
     let manifest = ManifestBuilder::new()
         // This is 10 XRD payment to Alice + 0.01 XRD fee to Victor.
-        .withdraw_from_account_by_amount(bob_account, dec!("10.01"), RADIX_TOKEN)
+        .withdraw_from_account(bob_account, RADIX_TOKEN, dec!("10.01"))
     
         .take_from_worktop_by_amount(
             dec!("10"), RADIX_TOKEN,
@@ -7243,7 +7286,7 @@ fn test_goldland_scenario() {
                         // and also 0.01 XRD fee to Victor.
                             .call_method(
                                 kaupa2, "accept_proposal",
-                                args!(
+                                manifest_args!(
                                     None::<String>,
                                     uuid1,
                                     false,
@@ -7275,7 +7318,7 @@ fn test_goldland_scenario() {
                                             builder
                                                 .call_method(
                                                     kaupa1, "collect_funds",
-                                                    args!(
+                                                    manifest_args!(
                                                         loaned_proof_id,
                                                         true,
                                                         true,
@@ -7331,7 +7374,7 @@ fn test_goldland_scenario() {
                                                 // to the loan.
                                                 .call_method(
                                                     kaupa2, "repay_flash_loan",
-                                                    args!(
+                                                    manifest_args!(
                                                         transient_bucket_id,
                                                         Vec::from([repayment_bucket_id])
                                                     ))
@@ -7346,7 +7389,7 @@ fn test_goldland_scenario() {
         // fees.
         .call_method(bob_account,
                      "deposit_batch",
-                     args!(ManifestExpression::EntireWorktop))
+                     manifest_args!(ManifestExpression::EntireWorktop))
         .build();
 
     let receipt = test_runner.execute_manifest_ignoring_fee(
@@ -7385,4 +7428,157 @@ fn test_goldland_scenario() {
                *test_runner.get_component_resources(bob_account).get(&transient_resource)
                .unwrap_or(&dec!("0")),
                "Bob should not have any transient tokens");
+
+
+
+
+    // Bob tries to do the same thing except not paying back the
+    // loan. The flash loan mechanic should prevent this tx from
+    // succeeding.
+    //
+    // The content is the same as the successful call above so I have
+    // removed most comments and only added comments where I made
+    // changes.
+    let manifest = ManifestBuilder::new()
+        // We take one extra XRD so we have 1 for our fake payback
+        // later
+        .withdraw_from_account(bob_account, RADIX_TOKEN, dec!("11.01"))
+        .take_from_worktop_by_amount(
+            dec!("10"), RADIX_TOKEN,
+            |builder, payment_bucket_id| {
+                builder.take_from_worktop_by_amount(
+                    dec!("0.01"), RADIX_TOKEN,
+                    |builder, fee_bucket_id| {
+                        builder
+                            .call_method(
+                                kaupa2, "accept_proposal",
+                                manifest_args!(
+                                    None::<String>,
+                                    uuid1,
+                                    false,
+                                    Vec::<ManifestBucket>::from([payment_bucket_id]),
+                                    Vec::<ManifestBucket>::from([fee_bucket_id])))
+                            .assert_worktop_contains_by_amount(1.into(), alice_nftres)
+                            .take_from_worktop_by_ids(
+                                &BTreeSet::from([1.into()]),
+                                alice_nftres,
+                                |builder, loaned_proof_bucket_id| {
+                                    builder.create_proof_from_bucket(
+                                        &loaned_proof_bucket_id,
+                                        |builder, loaned_proof_id| {
+                                            builder
+                                                .call_method(
+                                                    kaupa1, "collect_funds",
+                                                    manifest_args!(
+                                                        loaned_proof_id,
+                                                        true,
+                                                        true,
+                                                        None::<String>
+                                                    )
+                                                )
+                                        })
+                                    // I removed the assertions on
+                                    // loan amounts because that's
+                                    // not the point of this test
+                                        
+                                        .return_to_worktop(loaned_proof_bucket_id)
+                                })
+
+                            // Bob pretends to repay, but with XRD
+                            // instead of Alice's NFT #1
+                            .take_from_worktop(
+                                transient_resource,
+                                |builder, transient_bucket_id| {
+                                    builder.take_from_worktop(
+                                        RADIX_TOKEN,
+                                        |builder, repayment_bucket_id| {
+                                            builder
+                                                // This repayment
+                                                // should not be
+                                                // accepted
+                                                .call_method(
+                                                    kaupa2, "repay_flash_loan",
+                                                    manifest_args!(
+                                                        transient_bucket_id,
+                                                        Vec::from([repayment_bucket_id])
+                                                    ))
+                                        })
+                                })
+                    })
+            })
+        .call_method(bob_account,
+                     "deposit_batch",
+                     manifest_args!(ManifestExpression::EntireWorktop))
+        .build();
+
+    let receipt = test_runner.execute_manifest_ignoring_fee(
+        manifest,
+        vec![bob_nfgid.clone()],
+    );
+
+    receipt.expect_commit_failure();
+
+
+
+    // Bob tries to cheat again, but this time without calling the
+    // repay method at all. Again, the flash loan mechanic should
+    // prevent this tx from succeeding.
+    let manifest = ManifestBuilder::new()
+        .withdraw_from_account(bob_account, RADIX_TOKEN, dec!("10.01"))
+        .take_from_worktop_by_amount(
+            dec!("10"), RADIX_TOKEN,
+            |builder, payment_bucket_id| {
+                builder.take_from_worktop_by_amount(
+                    dec!("0.01"), RADIX_TOKEN,
+                    |builder, fee_bucket_id| {
+                        builder
+                            .call_method(
+                                kaupa2, "accept_proposal",
+                                manifest_args!(
+                                    None::<String>,
+                                    uuid1,
+                                    false,
+                                    Vec::<ManifestBucket>::from([payment_bucket_id]),
+                                    Vec::<ManifestBucket>::from([fee_bucket_id])))
+                            .assert_worktop_contains_by_amount(1.into(), alice_nftres)
+                            .take_from_worktop_by_ids(
+                                &BTreeSet::from([1.into()]),
+                                alice_nftres,
+                                |builder, loaned_proof_bucket_id| {
+                                    builder.create_proof_from_bucket(
+                                        &loaned_proof_bucket_id,
+                                        |builder, loaned_proof_id| {
+                                            builder
+                                                .call_method(
+                                                    kaupa1, "collect_funds",
+                                                    manifest_args!(
+                                                        loaned_proof_id,
+                                                        true,
+                                                        true,
+                                                        None::<String>
+                                                    )
+                                                )
+                                        })
+                                    // I removed the assertions on
+                                    // loan amounts because that's
+                                    // not the point of this test
+                                        
+                                        .return_to_worktop(loaned_proof_bucket_id)
+                                })
+
+                            // Bob sneakily removed the
+                            // repay_flash_loan call
+                    })
+            })
+        .call_method(bob_account,
+                     "deposit_batch",
+                     manifest_args!(ManifestExpression::EntireWorktop))
+        .build();
+
+    let receipt = test_runner.execute_manifest_ignoring_fee(
+        manifest,
+        vec![bob_nfgid.clone()],
+    );
+
+    receipt.expect_commit_failure();
 }
